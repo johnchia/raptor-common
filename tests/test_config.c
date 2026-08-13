@@ -5,6 +5,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #define CFG_PATH "/tmp/rss_test_config.ini"
@@ -625,6 +626,109 @@ TEST config_save_rapid_overwrite(void)
 	PASS();
 }
 
+/*
+ * True cross-process concurrency: config_save_stress_multi_daemon models
+ * daemons saving one after another in a single process, which never exercises
+ * the flock. Here each writer is a real process that loads once — as a daemon
+ * does at init — then dirties its own key against a copy going stale beneath
+ * it. A lost update means the surgical merge dropped a sibling's key.
+ */
+TEST config_save_concurrent_processes(void)
+{
+	const char *path = "/tmp/rss_test_config_concurrent.ini";
+	const char *lock = "/tmp/rss_test_config_concurrent.ini.lock";
+
+	/* Spans an existing key, a second key in the same section, a new key
+	 * in an existing section, and a section absent from the file. */
+	static const struct {
+		const char *sec;
+		const char *key;
+	} owned[] = {
+		{"rtsp", "port"},	  {"stream0", "bitrate"},
+		{"stream0", "gop"},	  {"http", "port"},
+		{"recording", "new_key"}, {"mqtt", "broker"},
+	};
+	const int nwriters = (int)(sizeof(owned) / sizeof(owned[0]));
+	const int niters = 40;
+
+	const char *seed = "# header comment\n"
+			   "\n"
+			   "[rtsp]\n"
+			   "port = 554                  # inline comment\n"
+			   "username = admin\n"
+			   "\n"
+			   "[stream0]\n"
+			   "bitrate = 3000000\n"
+			   "gop = 30\n"
+			   "# in-section comment\n"
+			   "codec = h264\n"
+			   "\n"
+			   "[http]\n"
+			   "port = 8080\n"
+			   "\n"
+			   "[recording]\n"
+			   "enabled = false\n";
+
+	unlink(path);
+	unlink(lock);
+	ASSERT_EQ(0, rss_write_file_atomic(path, seed, (int)strlen(seed)));
+
+	for (int w = 0; w < nwriters; w++) {
+		pid_t pid = fork();
+		ASSERT(pid >= 0);
+		if (pid == 0) {
+			rss_config_t *cfg = rss_config_load(path);
+			if (!cfg)
+				_exit(2);
+			for (int i = 0; i < niters; i++) {
+				char val[64];
+				snprintf(val, sizeof(val), "w%d-iter%d", w, i);
+				rss_config_set_str(cfg, owned[w].sec, owned[w].key, val);
+				if (rss_config_save(cfg, path) != 0) {
+					rss_config_free(cfg);
+					_exit(3);
+				}
+			}
+			rss_config_free(cfg);
+			_exit(0); /* skips atexit so the ASAN leak check stays in the parent */
+		}
+	}
+
+	for (int w = 0; w < nwriters; w++) {
+		int st = 0;
+		ASSERT(wait(&st) > 0);
+		ASSERT(WIFEXITED(st));
+		ASSERT_EQ(0, WEXITSTATUS(st));
+	}
+
+	rss_config_t *final = rss_config_load(path);
+	ASSERT(final);
+	for (int w = 0; w < nwriters; w++) {
+		char expect[64];
+		snprintf(expect, sizeof(expect), "w%d-iter%d", w, niters - 1);
+		ASSERT_STR_EQ(expect,
+			      rss_config_get_str(final, owned[w].sec, owned[w].key, ""));
+	}
+	/* Keys nobody owned must be untouched */
+	ASSERT_STR_EQ("admin", rss_config_get_str(final, "rtsp", "username", ""));
+	ASSERT_STR_EQ("h264", rss_config_get_str(final, "stream0", "codec", ""));
+	rss_config_free(final);
+
+	/* Comments must survive every one of those saves */
+	int sz = 0;
+	char *text = rss_read_file(path, &sz);
+	ASSERT(text);
+	ASSERT(strstr(text, "# header comment"));
+	ASSERT(strstr(text, "# inline comment"));
+	ASSERT(strstr(text, "# in-section comment"));
+	free(text);
+
+	unlink(path);
+	unlink(lock);
+	cleanup();
+	PASS();
+}
+
 /* New sections created by set_str must survive cross-daemon saves */
 TEST config_save_new_section_survives(void)
 {
@@ -1131,6 +1235,7 @@ SUITE(config_suite)
 	RUN_TEST(config_save_defaults_not_dirty);
 	RUN_TEST(config_save_stress_multi_daemon);
 	RUN_TEST(config_save_rapid_overwrite);
+	RUN_TEST(config_save_concurrent_processes);
 	RUN_TEST(config_save_new_section_survives);
 	RUN_TEST(config_save_no_dirty_noop);
 	RUN_TEST(config_foreach);
