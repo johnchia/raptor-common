@@ -34,7 +34,15 @@
 typedef struct rss_config_entry {
     char key[MAX_KEY];
     char value[MAX_VAL];
-    bool dirty; /* modified at runtime via set_str/set_int */
+    bool dirty;     /* modified at runtime via set_str/set_int */
+    bool defaulted; /* stored by a getter's miss path purely so
+                     * config-get-section can display the resolved
+                     * value. Display-only: value lookups treat the
+                     * entry as absent, so one call site's fallback can
+                     * never masquerade as configuration to another
+                     * call site with a different fallback (rvd once
+                     * cached 1920x1080 this way before the sensor was
+                     * known, and every 720p camera upscaled). */
     struct rss_config_entry *next;
 } rss_config_entry_t;
 
@@ -70,7 +78,8 @@ static rss_config_section_t *find_or_create_section(rss_config_t *cfg, const cha
     return s;
 }
 
-static void add_entry_ex(rss_config_section_t *sec, const char *key, const char *value, bool dirty)
+static void add_entry_ex(rss_config_section_t *sec, const char *key, const char *value, bool dirty,
+                         bool defaulted)
 {
     /* Overwrite if key already exists */
     rss_config_entry_t *e;
@@ -79,6 +88,9 @@ static void add_entry_ex(rss_config_section_t *sec, const char *key, const char 
             if (rss_strlcpy(e->value, value, sizeof(e->value)) >= sizeof(e->value))
                 RSS_WARN("config: value truncated for key '%s' (max %d)", key, MAX_VAL - 1);
             e->dirty = e->dirty || dirty;
+            /* A real write (file entry or set_*) permanently clears
+             * the display-only mark; a default refresh keeps it. */
+            e->defaulted = e->defaulted && defaulted;
             return;
         }
     }
@@ -92,13 +104,19 @@ static void add_entry_ex(rss_config_section_t *sec, const char *key, const char 
     if (rss_strlcpy(e->value, value, sizeof(e->value)) >= sizeof(e->value))
         RSS_WARN("config: value truncated for key '%s' (max %d)", key, MAX_VAL - 1);
     e->dirty = dirty;
+    e->defaulted = defaulted;
     e->next = sec->entries;
     sec->entries = e;
 }
 
 static void add_entry(rss_config_section_t *sec, const char *key, const char *value)
 {
-    add_entry_ex(sec, key, value, false);
+    add_entry_ex(sec, key, value, false, false);
+}
+
+static void add_entry_default(rss_config_section_t *sec, const char *key, const char *value)
+{
+    add_entry_ex(sec, key, value, false, true);
 }
 
 /* Find the '#' that starts an inline comment: ' #' or '\t#'.
@@ -249,21 +267,29 @@ const char *rss_config_get_str(rss_config_t *cfg, const char *section, const cha
             continue;
         rss_config_entry_t *e;
         for (e = s->entries; e; e = e->next) {
-            if (strcasecmp(e->key, key) == 0)
+            /* Display-only stored defaults are treated as absent, so
+             * every caller resolves against its OWN fallback -- the
+             * first reader's default must never become configuration
+             * for a later reader that knows better (the later reader
+             * often has the sensor-derived value). */
+            if (strcasecmp(e->key, key) == 0 && !e->defaulted)
                 return e->value;
         }
     }
 
-    /* Auto-populate default so config-get-section shows all resolved values.
-     * This mutates the config on read — acceptable because all daemon access
-     * is single-threaded (init + ctrl handler both on main thread via epoll).
-     * Not safe for concurrent readers on the same config object.
-     * Only when default_val is non-NULL (callers with NULL default don't want storage).
-     * Uses add_entry (not set_str) so defaults are NOT marked dirty. */
+    /* Auto-populate the default so config-get-section shows resolved
+     * values. This mutates the config on read — acceptable because all
+     * daemon access is single-threaded (init + ctrl handler both on
+     * main thread via epoll). Not safe for concurrent readers on the
+     * same config object. Only when default_val is non-NULL (callers
+     * with NULL default probe for presence and want no storage). The
+     * entry is marked display-only, never dirty: it is refreshed by
+     * whichever reader ran last, is invisible to value lookups, and is
+     * never written by a save. */
     if (default_val) {
         rss_config_section_t *ds = find_or_create_section(cfg, sec_name);
         if (ds) {
-            add_entry(ds, key, default_val);
+            add_entry_default(ds, key, default_val);
             rss_config_entry_t *de;
             for (de = ds->entries; de; de = de->next) {
                 if (strcasecmp(de->key, key) == 0)
@@ -278,13 +304,13 @@ int rss_config_get_int(rss_config_t *cfg, const char *section, const char *key, 
 {
     const char *val = rss_config_get_str(cfg, section, key, NULL);
     if (!val) {
-        /* Store default so config-get-section shows it (not dirty) */
+        /* Display-only store so config-get-section shows it */
         if (cfg) {
             char buf[32];
             snprintf(buf, sizeof(buf), "%d", default_val);
             rss_config_section_t *sec = find_or_create_section(cfg, section ? section : "");
             if (sec)
-                add_entry(sec, key, buf);
+                add_entry_default(sec, key, buf);
         }
         return default_val;
     }
@@ -300,11 +326,11 @@ bool rss_config_get_bool(rss_config_t *cfg, const char *section, const char *key
 {
     const char *val = rss_config_get_str(cfg, section, key, NULL);
     if (!val) {
-        /* Store default so config-get-section shows it (not dirty) */
+        /* Display-only store so config-get-section shows it */
         if (cfg) {
             rss_config_section_t *sec = find_or_create_section(cfg, section ? section : "");
             if (sec)
-                add_entry(sec, key, default_val ? "true" : "false");
+                add_entry_default(sec, key, default_val ? "true" : "false");
         }
         return default_val;
     }
@@ -371,9 +397,18 @@ void rss_config_set_str(rss_config_t *cfg, const char *section, const char *key,
 {
     if (!cfg || !key || !value)
         return;
-    rss_config_section_t *sec = find_or_create_section(cfg, section ? section : "");
+    /* An empty section is not a place. The writer would emit the key above
+     * the first [section] header, where no loader ever reads it again — a
+     * JPEG channel with an unset cfg_sect persisted its quality into
+     * exactly that oblivion. Refuse loudly; the parser still tolerates
+     * such lines in existing files, this only stops creating new ones. */
+    if (!section || !section[0]) {
+        RSS_WARN("config: refusing to set '%s' without a section", key);
+        return;
+    }
+    rss_config_section_t *sec = find_or_create_section(cfg, section);
     if (sec)
-        add_entry_ex(sec, key, value, true);
+        add_entry_ex(sec, key, value, true, false);
 }
 
 void rss_config_set_int(rss_config_t *cfg, const char *section, const char *key, int value)
@@ -435,11 +470,14 @@ static int config_write(rss_config_t *cfg, const char *path)
     for (i = nsec - 1; i >= 0; i--) {
         s = secs[i];
 
-        /* Count entries for reverse traversal */
+        /* Count entries for reverse traversal. Display-only stored
+         * defaults never reach the file: writing them would freeze one
+         * boot's fallbacks as configuration for every later boot. */
         int nent = 0;
         rss_config_entry_t *e;
         for (e = s->entries; e; e = e->next)
-            nent++;
+            if (!e->defaulted)
+                nent++;
 
         if (nent == 0)
             continue;
@@ -450,7 +488,8 @@ static int config_write(rss_config_t *cfg, const char *path)
 
         int j = 0;
         for (e = s->entries; e; e = e->next)
-            ents[j++] = e;
+            if (!e->defaulted)
+                ents[j++] = e;
 
         /* Section header (skip for global section) */
         if (s->name[0] != '\0') {

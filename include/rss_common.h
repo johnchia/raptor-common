@@ -284,6 +284,17 @@ extern const char *rss_build_platform __attribute__((weak));
 int rss_ctrl_handle_common(const char *cmd_json, char *resp_buf, int resp_buf_size,
                            rss_config_t *cfg, const char *config_path);
 
+/* Serializer-built control requests (rss_ctrl_client.c): the command
+ * JSON is assembled by cJSON and never appears at call sites. Same
+ * return contract as rss_ctrl_send_command. rss_ctrl_resp_is_ok()
+ * parses an answer's status field — never substring-match one. */
+int rss_ctrl_cmd(const char *sock_path, const char *cmd, char *resp, int resp_size, int timeout_ms);
+int rss_ctrl_cmd_int(const char *sock_path, const char *cmd, const char *key, int value, char *resp,
+                     int resp_size, int timeout_ms);
+int rss_ctrl_cmd_str(const char *sock_path, const char *cmd, const char *key, const char *value,
+                     char *resp, int resp_size, int timeout_ms);
+bool rss_ctrl_resp_is_ok(const char *resp);
+
 /* Format a control socket response. Returns byte count for handler return. */
 __attribute__((format(printf, 3, 4))) static inline int rss_ctrl_resp(char *buf, int size,
                                                                       const char *fmt, ...)
@@ -297,14 +308,42 @@ __attribute__((format(printf, 3, 4))) static inline int rss_ctrl_resp(char *buf,
     return (int)strlen(buf);
 }
 
+/* The status responses are built by cJSON, not by hand: the old
+ * printf forms silently truncated a long reason into INVALID JSON,
+ * and a %s of an unvetted string was one edit away from injection.
+ * On allocation failure they answer empty — clients already treat a
+ * zero-length response as an error. rss_ctrl_resp() above remains
+ * for the PLAIN-TEXT responses (raw config values, "restarting"),
+ * which are not JSON and must not pretend to be. */
 static inline int rss_ctrl_resp_ok(char *buf, int size)
 {
-    return rss_ctrl_resp(buf, size, "{\"status\":\"ok\"}");
+    if (size <= 0)
+        return 0;
+    buf[0] = '\0';
+    cJSON *r = cJSON_CreateObject();
+    if (!r)
+        return 0;
+    cJSON_AddStringToObject(r, "status", "ok");
+    if (!cJSON_PrintPreallocated(r, buf, size, 0))
+        buf[0] = '\0';
+    cJSON_Delete(r);
+    return (int)strlen(buf);
 }
 
 static inline int rss_ctrl_resp_error(char *buf, int size, const char *reason)
 {
-    return rss_ctrl_resp(buf, size, "{\"status\":\"error\",\"reason\":\"%s\"}", reason);
+    if (size <= 0)
+        return 0;
+    buf[0] = '\0';
+    cJSON *r = cJSON_CreateObject();
+    if (!r)
+        return 0;
+    cJSON_AddStringToObject(r, "status", "error");
+    cJSON_AddStringToObject(r, "reason", reason ? reason : "");
+    if (!cJSON_PrintPreallocated(r, buf, size, 0))
+        buf[0] = '\0';
+    cJSON_Delete(r);
+    return (int)strlen(buf);
 }
 
 /* Serialize a cJSON object into the response buffer and free it.
