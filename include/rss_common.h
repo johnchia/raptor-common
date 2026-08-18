@@ -130,6 +130,17 @@ void rss_config_set_int(rss_config_t *cfg, const char *section, const char *key,
 /* Set a boolean value in the running config. */
 void rss_config_set_bool(rss_config_t *cfg, const char *section, const char *key, bool value);
 
+/* Take a key out of the running config, and out of the file on the next
+ * save. The key reads as unset afterwards, so every caller resolves it
+ * against its own default again -- which is what makes this a reset to
+ * default rather than a write of one: nothing here holds a second copy
+ * of a default to drift from the one at the read site.
+ *
+ * Returns true if the key was set and is now marked for removal, false
+ * if it was already unset (including a key present only as a getter's
+ * resolved default, which has no line in the file to remove). */
+bool rss_config_unset(rss_config_t *cfg, const char *section, const char *key);
+
 /* True if any key was modified at runtime and not yet saved. */
 bool rss_config_has_dirty(const rss_config_t *cfg);
 

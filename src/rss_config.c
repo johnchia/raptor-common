@@ -43,6 +43,11 @@ typedef struct rss_config_entry {
                      * call site with a different fallback (rvd once
                      * cached 1920x1080 this way before the sensor was
                      * known, and every 720p camera upscaled). */
+    bool removed;   /* unset at runtime: the key is to be taken out of
+                     * the file on the next save. Like defaulted it is
+                     * invisible to value lookups -- an unset key is not
+                     * configuration -- but unlike defaulted it is dirty,
+                     * because a line has to be removed to honour it. */
     struct rss_config_entry *next;
 } rss_config_entry_t;
 
@@ -88,9 +93,18 @@ static void add_entry_ex(rss_config_section_t *sec, const char *key, const char 
             if (rss_strlcpy(e->value, value, sizeof(e->value)) >= sizeof(e->value))
                 RSS_WARN("config: value truncated for key '%s' (max %d)", key, MAX_VAL - 1);
             e->dirty = e->dirty || dirty;
-            /* A real write (file entry or set_*) permanently clears
-             * the display-only mark; a default refresh keeps it. */
-            e->defaulted = e->defaulted && defaulted;
+            if (defaulted) {
+                /* A refresh of a key an unset took out of the file is
+                 * all there is left to show for it, so it becomes the
+                 * display-only value the removal still owes. */
+                e->defaulted = e->defaulted || e->removed;
+            } else {
+                /* A real write (file entry or set_*) permanently clears
+                 * the display-only mark, and puts back a key an unset
+                 * had taken out. */
+                e->defaulted = false;
+                e->removed = false;
+            }
             return;
         }
     }
@@ -272,7 +286,7 @@ const char *rss_config_get_str(rss_config_t *cfg, const char *section, const cha
              * first reader's default must never become configuration
              * for a later reader that knows better (the later reader
              * often has the sensor-derived value). */
-            if (strcasecmp(e->key, key) == 0 && !e->defaulted)
+            if (strcasecmp(e->key, key) == 0 && !e->defaulted && !e->removed)
                 return e->value;
         }
     }
@@ -362,6 +376,11 @@ int rss_config_foreach(rss_config_t *cfg, const char *section,
             continue;
         rss_config_entry_t *e;
         for (e = s->entries; e; e = e->next) {
+            /* An unset key is gone from the section. It comes back
+             * only if a getter resolves it again, and then what it
+             * carries is that getter's default. */
+            if (e->removed)
+                continue;
             callback(e->key, e->value, userdata);
             count++;
         }
@@ -423,6 +442,36 @@ void rss_config_set_bool(rss_config_t *cfg, const char *section, const char *key
     rss_config_set_str(cfg, section, key, value ? "true" : "false");
 }
 
+bool rss_config_unset(rss_config_t *cfg, const char *section, const char *key)
+{
+    if (!cfg || !key)
+        return false;
+
+    const char *sec_name = section ? section : "";
+
+    rss_config_section_t *s;
+    for (s = cfg->sections; s; s = s->next) {
+        if (strcasecmp(s->name, sec_name) != 0)
+            continue;
+        rss_config_entry_t *e;
+        for (e = s->entries; e; e = e->next) {
+            if (strcasecmp(e->key, key) != 0)
+                continue;
+            /* A key that only ever existed as a getter's resolved
+             * default has no line in the file, so there is nothing to
+             * unset and nothing to save. Saying so is the point of the
+             * return value: a caller can tell "put back" from "was
+             * never set" without reading the file itself. */
+            if (e->defaulted || e->removed)
+                return false;
+            e->removed = true;
+            e->dirty = true;
+            return true;
+        }
+    }
+    return false;
+}
+
 bool rss_config_has_dirty(const rss_config_t *cfg)
 {
     if (!cfg)
@@ -472,11 +521,13 @@ static int config_write(rss_config_t *cfg, const char *path)
 
         /* Count entries for reverse traversal. Display-only stored
          * defaults never reach the file: writing them would freeze one
-         * boot's fallbacks as configuration for every later boot. */
+         * boot's fallbacks as configuration for every later boot. Nor
+         * do unset keys -- taking one out of the file is the whole of
+         * what an unset asks for. */
         int nent = 0;
         rss_config_entry_t *e;
         for (e = s->entries; e; e = e->next)
-            if (!e->defaulted)
+            if (!e->defaulted && !e->removed)
                 nent++;
 
         if (nent == 0)
@@ -488,7 +539,7 @@ static int config_write(rss_config_t *cfg, const char *path)
 
         int j = 0;
         for (e = s->entries; e; e = e->next)
-            if (!e->defaulted)
+            if (!e->defaulted && !e->removed)
                 ents[j++] = e;
 
         /* Section header (skip for global section) */
@@ -665,9 +716,10 @@ static int collect_dirty(rss_config_t *cfg, dirty_ref_t **out)
 
 /* Rewrite the file with only the dirty entries edited in: the last key
  * line that matches in its section is regenerated in place (keeping its
- * inline comment), new keys land at the end of their section's content,
- * new sections at end of file. Every other line — comments, blanks,
- * even lines the parser rejects — is emitted verbatim. */
+ * inline comment), or dropped entirely if the entry was unset; new keys
+ * land at the end of their section's content, new sections at end of
+ * file. Every other line — comments, blanks, even lines the parser
+ * rejects — is emitted verbatim. */
 static int config_write_surgical(const char *text, int tsize, dirty_ref_t *dr, int ndirty,
                                  const char *path)
 {
@@ -679,12 +731,15 @@ static int config_write_surgical(const char *text, int tsize, dirty_ref_t *dr, i
         nlines++;
 
     int *loff = NULL, *llen = NULL;
+    bool *drop = NULL;
     if (nlines > 0) {
         loff = malloc((size_t)nlines * sizeof(*loff));
         llen = malloc((size_t)nlines * sizeof(*llen));
-        if (!loff || !llen) {
+        drop = calloc((size_t)nlines, sizeof(*drop));
+        if (!loff || !llen || !drop) {
             free(loff);
             free(llen);
+            free(drop);
             return -1;
         }
         int l = 0, start = 0;
@@ -720,9 +775,22 @@ static int config_write_surgical(const char *text, int tsize, dirty_ref_t *dr, i
                 dr[d].replace_line = l;
                 dr[d].rep_key_end = li.key_end;
                 dr[d].rep_com_off = li.com_off;
+                /* A replace only has to reach the line the loader ends
+                 * up with -- the last one. A removal has to reach them
+                 * all, or an earlier duplicate becomes the value the
+                 * key was just unset from. */
+                if (dr[d].ent->removed)
+                    drop[l] = true;
             }
         }
     }
+
+    /* An unset key the file never carried has nothing to remove.
+     * Settling it here is what keeps every path below -- append, new
+     * section, global -- from having to ask whether it emits. */
+    for (int d = 0; d < ndirty; d++)
+        if (dr[d].ent->removed && dr[d].replace_line < 0)
+            dr[d].done = true;
 
     /* A replaced line grows by at most " = value"; appended keys,
      * headers, and separators are bounded by the fixed field sizes. */
@@ -731,13 +799,15 @@ static int config_write_surgical(const char *text, int tsize, dirty_ref_t *dr, i
     if (!out) {
         free(loff);
         free(llen);
+        free(drop);
         return -1;
     }
     int off = 0;
 
     /* Global-section keys with nothing to anchor to go at the top */
     for (int d = 0; d < ndirty; d++) {
-        if (dr[d].sec[0] == '\0' && dr[d].replace_line < 0 && dr[d].append_line < 0) {
+        if (!dr[d].done && dr[d].sec[0] == '\0' && dr[d].replace_line < 0 &&
+            dr[d].append_line < 0) {
             off += snprintf(out + off, (size_t)(cap - off), "%s = %s\n", dr[d].ent->key,
                             dr[d].ent->value);
             dr[d].done = true;
@@ -752,7 +822,13 @@ static int config_write_surgical(const char *text, int tsize, dirty_ref_t *dr, i
                 break;
             }
         }
-        if (rep >= 0) {
+        if (drop && drop[l]) {
+            /* The line goes, and nothing takes its place. A comment on
+             * a line of its own above it stays: it was never bound to
+             * this key, and the next value written here inherits it. */
+            if (rep >= 0)
+                dr[rep].done = true;
+        } else if (rep >= 0) {
             dirty_ref_t *r = &dr[rep];
             int vlen = (int)strlen(r->ent->value);
             int keylen = r->rep_key_end;
@@ -815,6 +891,7 @@ static int config_write_surgical(const char *text, int tsize, dirty_ref_t *dr, i
     free(out);
     free(loff);
     free(llen);
+    free(drop);
     return ret;
 }
 

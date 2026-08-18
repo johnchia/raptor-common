@@ -1219,6 +1219,168 @@ TEST config_save_overlong_line_preserved(void)
 	PASS();
 }
 
+/* ================================================================
+ * Unset: reset to default by taking the key out of the file
+ * ================================================================ */
+
+/* An unset key loses its line and nothing else on the way out */
+TEST config_unset_removes_the_line(void)
+{
+    rss_config_t *cfg = load_tpl();
+    ASSERT(cfg);
+
+    ASSERT_EQ(true, rss_config_unset(cfg, "stream0", "fps"));
+    ASSERT_EQ(0, rss_config_save(cfg, TPL_PATH));
+    rss_config_free(cfg);
+
+    int size = 0;
+    char *text = rss_read_file(TPL_PATH, &size);
+    ASSERT(text);
+
+    ASSERTm("the unset key kept its line", !strstr(text, "fps = 25"));
+    ASSERTm("the line's inline comment outlived the key", !strstr(text, "# frames per second"));
+
+    /* Everything around it survives: the section, its other key, the
+     * commented-out example, and the neighbouring sections. */
+    ASSERT(strstr(text, "[stream0]\nenabled = true\n"));
+    ASSERT(strstr(text, "# gop = 50\n"));
+    ASSERT(strstr(text, "# Raptor Streaming System configuration\n"));
+    ASSERT(strstr(text, "[audio]\n"));
+    free(text);
+
+    /* And the key now resolves to whatever the reader brings */
+    rss_config_t *check = rss_config_load(TPL_PATH);
+    ASSERT(check);
+    ASSERT_EQ(30, rss_config_get_int(check, "stream0", "fps", 30));
+    ASSERT_EQ(true, rss_config_get_bool(check, "stream0", "enabled", false));
+    rss_config_free(check);
+
+    unlink(TPL_PATH);
+    PASS();
+}
+
+/* Readers see the unset the moment it is made, not at the save */
+TEST config_unset_reads_as_absent_before_the_save(void)
+{
+    rss_config_t *cfg = load_tpl();
+    ASSERT(cfg);
+
+    ASSERT_EQ(25, rss_config_get_int(cfg, "stream0", "fps", 30));
+    ASSERT_EQ(true, rss_config_unset(cfg, "stream0", "fps"));
+    ASSERTm("an unset key still answered with its old value",
+            30 == rss_config_get_int(cfg, "stream0", "fps", 30));
+    ASSERT_EQ(NULL, rss_config_get_str(cfg, "stream0", "fps", NULL));
+
+    rss_config_free(cfg);
+    unlink(TPL_PATH);
+    PASS();
+}
+
+/* Unsetting a key nobody set is not a change, and must not cost a write */
+TEST config_unset_of_an_unset_key_writes_nothing(void)
+{
+    rss_config_t *cfg = load_tpl();
+    ASSERT(cfg);
+
+    struct stat before;
+    ASSERT_EQ(0, stat(TPL_PATH, &before));
+
+    ASSERT_EQ(false, rss_config_unset(cfg, "stream0", "gop"));
+    ASSERT_EQ(false, rss_config_unset(cfg, "nosuch", "key"));
+
+    /* A key present only as a getter's resolved default has no line to
+     * remove, and saying so is how a caller tells the two apart. */
+    (void)rss_config_get_int(cfg, "stream0", "bitrate", 2000000);
+    ASSERT_EQ(false, rss_config_unset(cfg, "stream0", "bitrate"));
+
+    ASSERT_EQ(false, rss_config_has_dirty(cfg));
+    ASSERT_EQ(0, rss_config_save(cfg, TPL_PATH));
+    rss_config_free(cfg);
+
+    struct stat after;
+    ASSERT_EQ(0, stat(TPL_PATH, &after));
+    ASSERT_EQm("an unset of nothing rewrote the file", before.st_ino, after.st_ino);
+
+    unlink(TPL_PATH);
+    PASS();
+}
+
+/* The same key name in another section is a different key */
+TEST config_unset_leaves_the_same_key_in_other_sections(void)
+{
+    rss_config_t *cfg = load_tpl();
+    ASSERT(cfg);
+
+    ASSERT_EQ(true, rss_config_unset(cfg, "audio", "enabled"));
+    ASSERT_EQ(0, rss_config_save(cfg, TPL_PATH));
+    rss_config_free(cfg);
+
+    rss_config_t *check = rss_config_load(TPL_PATH);
+    ASSERT(check);
+    ASSERT_EQ(true, rss_config_get_bool(check, "stream0", "enabled", false));
+    ASSERT_EQ(NULL, rss_config_get_str(check, "audio", "enabled", NULL));
+    ASSERT_STR_EQ("aac", rss_config_get_str(check, "audio", "codec", ""));
+    rss_config_free(check);
+
+    unlink(TPL_PATH);
+    PASS();
+}
+
+/* Every duplicate goes, or the earlier one becomes the value */
+TEST config_unset_removes_every_duplicate(void)
+{
+    const char *dup = "[a]\n"
+                      "k = first\n"
+                      "other = keep\n"
+                      "k = second\n";
+    rss_config_t *cfg = load_ini(dup);
+    ASSERT(cfg);
+    ASSERT_STR_EQ("second", rss_config_get_str(cfg, "a", "k", ""));
+
+    ASSERT_EQ(true, rss_config_unset(cfg, "a", "k"));
+    ASSERT_EQ(0, rss_config_save(cfg, CFG_PATH));
+    rss_config_free(cfg);
+
+    rss_config_t *check = rss_config_load(CFG_PATH);
+    ASSERT(check);
+    ASSERTm("an earlier duplicate survived the unset",
+            NULL == rss_config_get_str(check, "a", "k", NULL));
+    ASSERT_STR_EQ("keep", rss_config_get_str(check, "a", "other", ""));
+    rss_config_free(check);
+
+    cleanup();
+    PASS();
+}
+
+/* Setting a value again in the same session puts the key back, once */
+TEST config_unset_then_set_puts_the_key_back(void)
+{
+    rss_config_t *cfg = load_tpl();
+    ASSERT(cfg);
+
+    ASSERT_EQ(true, rss_config_unset(cfg, "stream0", "fps"));
+    rss_config_set_int(cfg, "stream0", "fps", 20);
+    ASSERT_EQ(20, rss_config_get_int(cfg, "stream0", "fps", 30));
+    ASSERT_EQ(0, rss_config_save(cfg, TPL_PATH));
+    rss_config_free(cfg);
+
+    int size = 0;
+    char *text = rss_read_file(TPL_PATH, &size);
+    ASSERT(text);
+    char *first = strstr(text, "fps = 20");
+    ASSERT(first);
+    ASSERTm("the key was written twice", !strstr(first + 1, "fps = 20"));
+    free(text);
+
+    rss_config_t *check = rss_config_load(TPL_PATH);
+    ASSERT(check);
+    ASSERT_EQ(20, rss_config_get_int(check, "stream0", "fps", 30));
+    rss_config_free(check);
+
+    unlink(TPL_PATH);
+    PASS();
+}
+
 SUITE(config_suite)
 {
 	RUN_TEST(config_load_basic);
@@ -1254,4 +1416,10 @@ SUITE(config_suite)
 	RUN_TEST(config_save_max_value_replace);
 	RUN_TEST(config_save_replace_never_unparseable);
 	RUN_TEST(config_save_overlong_line_preserved);
+    RUN_TEST(config_unset_removes_the_line);
+    RUN_TEST(config_unset_reads_as_absent_before_the_save);
+    RUN_TEST(config_unset_of_an_unset_key_writes_nothing);
+    RUN_TEST(config_unset_leaves_the_same_key_in_other_sections);
+    RUN_TEST(config_unset_removes_every_duplicate);
+    RUN_TEST(config_unset_then_set_puts_the_key_back);
 }
