@@ -181,6 +181,52 @@ static inline int rss_listen_tcp(int port, int backlog)
     return fd;
 }
 
+/*
+ * As above, bound to one address rather than the wildcard.
+ *
+ * A camera in setup mode answers on the access point it raised and nowhere
+ * else. Binding the wildcard there would put the same unauthenticated daemon
+ * on every interface the camera happens to have -- which on a camera being set
+ * up is the one network nobody has chosen yet.
+ *
+ * IPv4 only, deliberately: the address is one the camera assigned itself on a
+ * link it is the only router for, and there is no IPv6 equivalent of that
+ * situation here. An empty address is the wildcard, so a caller with nothing
+ * to restrict to does not need a second branch.
+ */
+static inline int rss_listen_tcp_addr(const char *addr, int port, int backlog)
+{
+    if (!addr || !addr[0])
+        return rss_listen_tcp(port, backlog);
+
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0)
+        return -1;
+
+    int one = 1;
+    (void)setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+
+    struct sockaddr_in a4;
+    memset(&a4, 0, sizeof(a4));
+    a4.sin_family = AF_INET;
+    a4.sin_port = htons((uint16_t)port);
+
+    if (inet_pton(AF_INET, addr, &a4.sin_addr) != 1) {
+        close(fd);
+        errno = EINVAL;
+        return -1;
+    }
+    if (bind(fd, (struct sockaddr *)&a4, sizeof(a4)) < 0) {
+        close(fd);
+        return -1;
+    }
+    if (listen(fd, backlog) < 0) {
+        close(fd);
+        return -1;
+    }
+    return fd;
+}
+
 /* Set TCP_NODELAY on a socket. */
 static inline void rss_set_tcp_nodelay(int fd)
 {
