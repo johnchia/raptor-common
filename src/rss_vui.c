@@ -1,14 +1,15 @@
 /*
- * rss_vui.c -- correct the coded range declaration in an SPS VUI.
+ * rss_vui.c -- correct the coded range and colour matrix declarations
+ * in an SPS VUI.
  *
  * The walk implements exactly as much of H.264 7.3.2.1.1 / H.265
- * 7.3.2.2.1 as it takes to reach video_full_range_flag, but every
- * field on that path is consumed per spec (scaling lists, short-term
- * ref pic sets, sub-layer loops), so an encoder that emits any of the
- * optional structures does not derail the offsets. The bitstream is
- * unescaped before parsing and re-escaped after the edit; the edit is
- * only committed when the escaped length is unchanged, which keeps it
- * legal for buffers other readers map.
+ * 7.3.2.2.1 as it takes to reach the video_signal_type block, but
+ * every field on that path is consumed per spec (scaling lists,
+ * short-term ref pic sets, sub-layer loops), so an encoder that emits
+ * any of the optional structures does not derail the offsets. The
+ * bitstream is unescaped before parsing and re-escaped after the
+ * edit; the edit is only committed when the escaped length is
+ * unchanged, which keeps it legal for buffers other readers map.
  */
 
 #include <string.h>
@@ -356,7 +357,27 @@ static int64_t h265_full_range_bit(vui_bits_t *b)
     return (int64_t)b->bit; /* video_full_range_flag */
 }
 
-int rss_vui_set_full_range(uint8_t *nal, uint32_t len, int is_h265)
+/* Continue a walk from the full-range flag to matrix_coefficients.
+ * Returns its bit offset, VUI_ABSENT when the stream carries no
+ * colour_description block, VUI_BAD on overflow. */
+static int64_t vui_matrix_bit(vui_bits_t *b, int64_t full_range_bit)
+{
+    b->bit = (uint32_t)full_range_bit;
+    b->overflow = 0;
+    vb_read(b, 1);      /* video_full_range_flag */
+    if (!vb_read(b, 1)) /* colour_description_present */
+        return b->overflow ? VUI_BAD : VUI_ABSENT;
+    vb_read(b, 8); /* colour_primaries */
+    vb_read(b, 8); /* transfer_characteristics */
+    if (b->overflow)
+        return VUI_BAD;
+    return (int64_t)b->bit; /* matrix_coefficients */
+}
+
+/* Shared edit core. `matrix` < 0 sets video_full_range_flag; 0..255
+ * rewrites matrix_coefficients to that value. Both edits re-escape and
+ * commit only when the escaped byte length is unchanged. */
+static int vui_edit(uint8_t *nal, uint32_t len, int is_h265, int matrix)
 {
     if (!nal || len < 4)
         return -1;
@@ -393,11 +414,32 @@ int rss_vui_set_full_range(uint8_t *nal, uint32_t len, int is_h265)
     if (bit < 0 || (uint32_t)bit >= rbsp_len * 8)
         return -1;
 
-    uint8_t *byte = &rbsp[bit >> 3];
-    uint8_t mask = (uint8_t)(1u << (7 - (bit & 7)));
-    if (*byte & mask)
-        return 0; /* already full range */
-    *byte |= mask;
+    if (matrix < 0) {
+        uint8_t *byte = &rbsp[bit >> 3];
+        uint8_t mask = (uint8_t)(1u << (7 - (bit & 7)));
+        if (*byte & mask)
+            return 0; /* already full range */
+        *byte |= mask;
+    } else {
+        int64_t mbit = vui_matrix_bit(&b, bit);
+        if (mbit == VUI_ABSENT)
+            return 0;
+        if (mbit < 0 || (uint32_t)mbit + 8 > rbsp_len * 8)
+            return -1;
+        vui_bits_t r = b;
+        r.bit = (uint32_t)mbit;
+        r.overflow = 0;
+        if (vb_read(&r, 8) == (uint32_t)matrix)
+            return 0; /* already declared */
+        for (int i = 0; i < 8; i++) {
+            uint32_t pos = (uint32_t)mbit + (uint32_t)i;
+            uint8_t mask = (uint8_t)(1u << (7 - (pos & 7)));
+            if ((matrix >> (7 - i)) & 1)
+                rbsp[pos >> 3] |= mask;
+            else
+                rbsp[pos >> 3] &= (uint8_t)~mask;
+        }
+    }
 
     uint8_t esc[VUI_RBSP_MAX + 64];
     uint32_t esc_len = vui_escape(rbsp, rbsp_len, esc, sizeof(esc));
@@ -406,4 +448,14 @@ int rss_vui_set_full_range(uint8_t *nal, uint32_t len, int is_h265)
     }
     memcpy(nal + hdr, esc, esc_len);
     return 1;
+}
+
+int rss_vui_set_full_range(uint8_t *nal, uint32_t len, int is_h265)
+{
+    return vui_edit(nal, len, is_h265, -1);
+}
+
+int rss_vui_set_matrix(uint8_t *nal, uint32_t len, int is_h265, uint8_t matrix)
+{
+    return vui_edit(nal, len, is_h265, matrix);
 }

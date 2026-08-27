@@ -26,4 +26,22 @@
  */
 int rss_vui_set_full_range(uint8_t *nal, uint32_t len, int is_h265);
 
+/*
+ * rss_vui_set_matrix -- correct the matrix_coefficients declaration.
+ *
+ * The ISP converts sensor data to YUV with its BT.601 full-range
+ * table (the firmware boot default; nothing in this stack reprograms
+ * it) and the OSD compositor measures as BT.601 as well (injected
+ * primaries land on the 601 luma predictions within 7 codes, 15-24
+ * away from 709), but the SPS VUI the encoder writes declares BT.709,
+ * so players reconstruct hues with the wrong matrix.
+ * matrix_coefficients is a fixed 8-bit field, so the rewrite is
+ * fixed-width; as with the range flag, the edit is committed only
+ * when the escaped byte length is unchanged.
+ *
+ * Returns 1 modified, 0 already declared / no colour description
+ * block present, -1 unparseable or the length would change.
+ */
+int rss_vui_set_matrix(uint8_t *nal, uint32_t len, int is_h265, uint8_t matrix);
+
 #endif
