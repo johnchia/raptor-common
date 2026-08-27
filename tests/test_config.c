@@ -1069,41 +1069,43 @@ TEST config_save_replace_keeps_spelling(void)
 	PASS();
 }
 
-/* Keys in the global (unnamed) section stay above the first header */
+/* Keys already in the global (unnamed) section survive a save, above the
+ * first header, but a set without a section is refused rather than
+ * written there (f1c01d3): nothing reads that region back */
 TEST config_save_global_section_append(void)
 {
-	const char *path = "/tmp/rss_test_config_glob.ini";
-	const char *ini = "# banner\n\nport = 1\n\n[s]\nk = v\n";
-	ASSERT_EQ(0, rss_write_file_atomic(path, ini, (int)strlen(ini)));
-	rss_config_t *cfg = rss_config_load(path);
-	ASSERT(cfg);
-	rss_config_set_str(cfg, NULL, "port", "2");
-	rss_config_set_str(cfg, NULL, "gkey", "gval");
-	ASSERT_EQ(0, rss_config_save(cfg, path));
-	rss_config_free(cfg);
+    const char *path = "/tmp/rss_test_config_glob.ini";
+    const char *ini = "# banner\n\nport = 1\n\n[s]\nk = v\n";
+    ASSERT_EQ(0, rss_write_file_atomic(path, ini, (int)strlen(ini)));
+    rss_config_t *cfg = rss_config_load(path);
+    ASSERT(cfg);
+    rss_config_set_str(cfg, NULL, "port", "2");
+    rss_config_set_str(cfg, "", "gkey", "gval");
+    ASSERT_STR_EQ("1", rss_config_get_str(cfg, NULL, "port", ""));
+    ASSERT_STR_EQ("", rss_config_get_str(cfg, NULL, "gkey", ""));
+    ASSERT_EQ(0, rss_config_save(cfg, path));
+    rss_config_free(cfg);
 
-	int size = 0;
-	char *text = rss_read_file(path, &size);
-	ASSERT(text);
-	ASSERT(strstr(text, "# banner\n"));
-	char *sec = strstr(text, "[s]");
-	char *port = strstr(text, "port = 2");
-	char *gk = strstr(text, "gkey = gval");
-	ASSERT(sec);
-	ASSERT(port);
-	ASSERT(gk);
-	ASSERT(port < sec);
-	ASSERT(gk < sec);
-	free(text);
+    int size = 0;
+    char *text = rss_read_file(path, &size);
+    ASSERT(text);
+    ASSERT(strstr(text, "# banner\n"));
+    char *sec = strstr(text, "[s]");
+    char *port = strstr(text, "port = 1");
+    ASSERT(sec);
+    ASSERT(port);
+    ASSERT(port < sec);
+    ASSERT(strstr(text, "gkey") == NULL);
+    ASSERT(strstr(text, "port = 2") == NULL);
+    free(text);
 
-	rss_config_t *check = rss_config_load(path);
-	ASSERT(check);
-	ASSERT_STR_EQ("2", rss_config_get_str(check, NULL, "port", ""));
-	ASSERT_STR_EQ("gval", rss_config_get_str(check, NULL, "gkey", ""));
-	ASSERT_STR_EQ("v", rss_config_get_str(check, "s", "k", ""));
-	rss_config_free(check);
-	unlink(path);
-	PASS();
+    rss_config_t *check = rss_config_load(path);
+    ASSERT(check);
+    ASSERT_STR_EQ("1", rss_config_get_str(check, NULL, "port", ""));
+    ASSERT_STR_EQ("v", rss_config_get_str(check, "s", "k", ""));
+    rss_config_free(check);
+    unlink(path);
+    PASS();
 }
 
 /* A maximum-length value through the replacement path, on a line that
