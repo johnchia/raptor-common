@@ -141,6 +141,12 @@ void rss_config_set_bool(rss_config_t *cfg, const char *section, const char *key
  * resolved default, which has no line in the file to remove). */
 bool rss_config_unset(rss_config_t *cfg, const char *section, const char *key);
 
+/* Remove a whole section -- its header and every key under it -- on the
+ * next save. False if the config has no such section. A key at a time
+ * cannot do this: a caller unsets the keys it knows about, and what is
+ * left of the section is the ones it does not. */
+bool rss_config_remove_section(rss_config_t *cfg, const char *section);
+
 /* True if any key was modified at runtime and not yet saved. */
 bool rss_config_has_dirty(const rss_config_t *cfg);
 

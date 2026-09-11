@@ -53,6 +53,15 @@ typedef struct rss_config_entry {
 
 typedef struct rss_config_section {
     char name[MAX_SECN];
+    bool removed; /* taken out at runtime: the header and every key
+                   * under it leave the file on the next save, and
+                   * until then nothing sees the section at all. Sticky,
+                   * because the section is gone for this process's
+                   * lifetime and not merely absent from the file. */
+    bool dirty;   /* the removal has not reached the file yet. Separate
+                   * from `removed` for the reason an entry's two flags
+                   * are separate: a save settles the file, not the
+                   * fact. */
     rss_config_entry_t *entries;
     struct rss_config_section *next;
 } rss_config_section_t;
@@ -372,7 +381,7 @@ int rss_config_foreach(rss_config_t *cfg, const char *section,
 
     rss_config_section_t *s;
     for (s = cfg->sections; s; s = s->next) {
-        if (strcasecmp(s->name, sec_name) != 0)
+        if (strcasecmp(s->name, sec_name) != 0 || s->removed)
             continue;
         rss_config_entry_t *e;
         for (e = s->entries; e; e = e->next) {
@@ -402,6 +411,11 @@ int rss_config_foreach_section(rss_config_t *cfg, const char *prefix,
     for (s = cfg->sections; s; s = s->next) {
         if (plen > 0 && strncasecmp(s->name, prefix, plen) != 0)
             continue;
+        /* A removed section is not one of the file's, which is what a
+         * walk over them is for: rod reads its overlay elements this
+         * way, and one taken out has stopped being an element. */
+        if (s->removed)
+            continue;
         callback(s->name, userdata);
         count++;
     }
@@ -426,8 +440,15 @@ void rss_config_set_str(rss_config_t *cfg, const char *section, const char *key,
         return;
     }
     rss_config_section_t *sec = find_or_create_section(cfg, section);
-    if (sec)
-        add_entry_ex(sec, key, value, true, false);
+    if (!sec)
+        return;
+    /* Writing into a section that was removed puts it back, the way
+     * writing a key an unset took out puts that back. The header owes
+     * the file nothing now -- the entry below will carry it, through
+     * the same path that writes a section the file never had. */
+    sec->removed = false;
+    sec->dirty = false;
+    add_entry_ex(sec, key, value, true, false);
 }
 
 void rss_config_set_int(rss_config_t *cfg, const char *section, const char *key, int value)
@@ -472,16 +493,58 @@ bool rss_config_unset(rss_config_t *cfg, const char *section, const char *key)
     return false;
 }
 
+/*
+ * Take a whole section out: its header and every key under it.
+ *
+ * A key at a time is not the same thing, because a caller unsets the
+ * keys it knows about and a section is whatever the file put there --
+ * [osd.camera] stripped of the four an editor offers still has its
+ * `type` and its `max_chars`, and is still a section, still an
+ * element, still drawn. This takes the keys it never heard of too, and
+ * the header with them.
+ *
+ * Answers false for a section the config does not have, so a caller
+ * can tell a removal from a name that was never there.
+ */
+bool rss_config_remove_section(rss_config_t *cfg, const char *section)
+{
+    if (!cfg || !section || !section[0])
+        return false;
+
+    rss_config_section_t *s;
+    for (s = cfg->sections; s; s = s->next) {
+        if (strcasecmp(s->name, section) != 0 || s->removed)
+            continue;
+
+        rss_config_entry_t *e;
+        for (e = s->entries; e; e = e->next) {
+            /* A key that was only ever a getter's resolved default has
+             * no line to take out. */
+            if (e->defaulted || e->removed)
+                continue;
+            e->removed = true;
+            e->dirty = true;
+        }
+        s->removed = true;
+        s->dirty = true;
+        return true;
+    }
+    return false;
+}
+
 bool rss_config_has_dirty(const rss_config_t *cfg)
 {
     if (!cfg)
         return false;
     const rss_config_section_t *s;
     const rss_config_entry_t *e;
-    for (s = cfg->sections; s; s = s->next)
+    for (s = cfg->sections; s; s = s->next) {
+        if (s->removed && s->dirty)
+            return true;
         for (e = s->entries; e; e = e->next)
             if (e->dirty)
                 return true;
+    }
     return false;
 }
 
@@ -663,6 +726,9 @@ static void classify_line(const char *raw, int len, line_info_t *li)
 
 typedef struct {
     const char *sec; /* section name, entry spelling */
+    /* NULL: the section's own header line, which only a removed
+     * section owes -- a section with no keys left has nothing else
+     * to hang its removal on. */
     rss_config_entry_t *ent;
     int replace_line; /* line whose key this entry replaces, or -1 */
     int rep_key_end;  /* that line's key_end */
@@ -681,10 +747,16 @@ static int collect_dirty(rss_config_t *cfg, dirty_ref_t **out)
     rss_config_entry_t *e;
 
     *out = NULL;
-    for (s = cfg->sections; s; s = s->next)
+    for (s = cfg->sections; s; s = s->next) {
+        /* A section leaving owes the file one more line than its keys
+         * do -- its header -- and a section that had no keys owes only
+         * that, so it cannot be reached through the entries. */
+        if (s->removed && s->dirty)
+            ndirty++;
         for (e = s->entries; e; e = e->next)
             if (e->dirty)
                 ndirty++;
+    }
     if (ndirty == 0)
         return 0;
 
@@ -694,6 +766,13 @@ static int collect_dirty(rss_config_t *cfg, dirty_ref_t **out)
 
     int d = 0;
     for (s = cfg->sections; s; s = s->next) {
+        if (s->removed && s->dirty) {
+            dr[d].sec = s->name;
+            dr[d].ent = NULL; /* the header itself */
+            dr[d].replace_line = -1;
+            dr[d].append_line = -1;
+            d++;
+        }
         for (e = s->entries; e; e = e->next) {
             if (!e->dirty)
                 continue;
@@ -767,11 +846,18 @@ static int config_write_surgical(const char *text, int tsize, dirty_ref_t *dr, i
         for (int d = 0; d < ndirty; d++) {
             if (strcasecmp(dr[d].sec, cursec) != 0)
                 continue;
-            if (li.kind == 1)
+            if (li.kind == 1) {
                 dr[d].sec_in_file = true;
+                /* A removed section's line is its header, and it goes
+                 * the way a removed key's line goes. */
+                if (!dr[d].ent) {
+                    dr[d].replace_line = l;
+                    drop[l] = true;
+                }
+            }
             if (li.nonblank)
                 dr[d].append_line = l;
-            if (li.kind == 2 && strcasecmp(dr[d].ent->key, li.key) == 0) {
+            if (li.kind == 2 && dr[d].ent && strcasecmp(dr[d].ent->key, li.key) == 0) {
                 dr[d].replace_line = l;
                 dr[d].rep_key_end = li.key_end;
                 dr[d].rep_com_off = li.com_off;
@@ -789,8 +875,25 @@ static int config_write_surgical(const char *text, int tsize, dirty_ref_t *dr, i
      * Settling it here is what keeps every path below -- append, new
      * section, global -- from having to ask whether it emits. */
     for (int d = 0; d < ndirty; d++)
-        if (dr[d].ent->removed && dr[d].replace_line < 0)
+        if ((!dr[d].ent || dr[d].ent->removed) && dr[d].replace_line < 0)
             dr[d].done = true;
+
+    /* A section is written with a blank line above it to separate it
+     * from the last, so a section leaving takes that with it -- or a
+     * file edited a few times fills up with the gaps between things
+     * that are no longer there. */
+    for (int l = 1; drop && l < nlines; l++) {
+        line_info_t hi, pi;
+
+        if (!drop[l])
+            continue;
+        classify_line(text + loff[l], llen[l], &hi);
+        if (hi.kind != 1)
+            continue;
+        classify_line(text + loff[l - 1], llen[l - 1], &pi);
+        if (!pi.nonblank)
+            drop[l - 1] = true;
+    }
 
     /* A replaced line grows by at most " = value"; appended keys,
      * headers, and separators are bounded by the fixed field sizes. */
@@ -806,7 +909,7 @@ static int config_write_surgical(const char *text, int tsize, dirty_ref_t *dr, i
 
     /* Global-section keys with nothing to anchor to go at the top */
     for (int d = 0; d < ndirty; d++) {
-        if (!dr[d].done && dr[d].sec[0] == '\0' && dr[d].replace_line < 0 &&
+        if (dr[d].ent && !dr[d].done && dr[d].sec[0] == '\0' && dr[d].replace_line < 0 &&
             dr[d].append_line < 0) {
             off += snprintf(out + off, (size_t)(cap - off), "%s = %s\n", dr[d].ent->key,
                             dr[d].ent->value);
@@ -828,7 +931,7 @@ static int config_write_surgical(const char *text, int tsize, dirty_ref_t *dr, i
              * this key, and the next value written here inherits it. */
             if (rep >= 0)
                 dr[rep].done = true;
-        } else if (rep >= 0) {
+        } else if (rep >= 0 && dr[rep].ent) {
             dirty_ref_t *r = &dr[rep];
             int vlen = (int)strlen(r->ent->value);
             int keylen = r->rep_key_end;
@@ -863,7 +966,7 @@ static int config_write_surgical(const char *text, int tsize, dirty_ref_t *dr, i
             out[off++] = '\n';
         }
         for (int d = 0; d < ndirty; d++) {
-            if (!dr[d].done && dr[d].replace_line < 0 && dr[d].append_line == l) {
+            if (dr[d].ent && !dr[d].done && dr[d].replace_line < 0 && dr[d].append_line == l) {
                 off += snprintf(out + off, (size_t)(cap - off), "%s = %s\n", dr[d].ent->key,
                                 dr[d].ent->value);
                 dr[d].done = true;
@@ -873,13 +976,13 @@ static int config_write_surgical(const char *text, int tsize, dirty_ref_t *dr, i
 
     /* Sections the file does not have yet */
     for (int d = 0; d < ndirty; d++) {
-        if (dr[d].done || dr[d].sec_in_file || dr[d].sec[0] == '\0')
+        if (!dr[d].ent || dr[d].done || dr[d].sec_in_file || dr[d].sec[0] == '\0')
             continue;
         if (off > 0 && !(off > 1 && out[off - 1] == '\n' && out[off - 2] == '\n'))
             out[off++] = '\n';
         off += snprintf(out + off, (size_t)(cap - off), "[%s]\n", dr[d].sec);
         for (int d2 = d; d2 < ndirty; d2++) {
-            if (dr[d2].done || strcasecmp(dr[d2].sec, dr[d].sec) != 0)
+            if (!dr[d2].ent || dr[d2].done || strcasecmp(dr[d2].sec, dr[d].sec) != 0)
                 continue;
             off += snprintf(out + off, (size_t)(cap - off), "%s = %s\n", dr[d2].ent->key,
                             dr[d2].ent->value);
@@ -941,6 +1044,7 @@ int rss_config_save(rss_config_t *cfg, const char *path)
         rss_config_section_t *s;
         for (s = cfg->sections; s; s = s->next) {
             rss_config_entry_t *e;
+            s->dirty = false;
             for (e = s->entries; e; e = e->next)
                 e->dirty = false;
         }
