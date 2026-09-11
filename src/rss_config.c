@@ -838,11 +838,14 @@ static int config_write_surgical(const char *text, int tsize, dirty_ref_t *dr, i
 
     /* Bind every dirty entry to the file */
     char cursec[MAX_SECN] = "";
+    bool in_removed = false; /* under a removed section's header */
     line_info_t li;
     for (int l = 0; l < nlines; l++) {
         classify_line(text + loff[l], llen[l], &li);
-        if (li.kind == 1)
+        if (li.kind == 1) {
             rss_strlcpy(cursec, li.sec, sizeof(cursec));
+            in_removed = false;
+        }
         for (int d = 0; d < ndirty; d++) {
             if (strcasecmp(dr[d].sec, cursec) != 0)
                 continue;
@@ -853,6 +856,7 @@ static int config_write_surgical(const char *text, int tsize, dirty_ref_t *dr, i
                 if (!dr[d].ent) {
                     dr[d].replace_line = l;
                     drop[l] = true;
+                    in_removed = true;
                 }
             }
             if (li.nonblank)
@@ -869,6 +873,12 @@ static int config_write_surgical(const char *text, int tsize, dirty_ref_t *dr, i
                     drop[l] = true;
             }
         }
+        /* A section is every line under its header, not the keys this
+         * config happens to hold: one another writer put there since the
+         * load, and a comment, go with it. The blank line before the next
+         * header stays, as that section's separator. */
+        if (in_removed && li.kind != 1 && li.nonblank)
+            drop[l] = true;
     }
 
     /* An unset key the file never carried has nothing to remove.
